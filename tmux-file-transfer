@@ -1,0 +1,102 @@
+#!/bin/bash
+#
+# Copyright 2019 Stephen Hamer
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#
+# Transfer files through the tmux scrollback buffer
+# to setup the scrollback buffer size, add the following to ~/.tmux.conf
+# set-option -g history-limit 104857600
+#
+# To transfer files between machines:
+# 1) on localhost start tmux
+# 2) in tmux ssh to remote host
+# 3) copy tmux-file-transfer using copy/paste
+# 4) run ./tmux-file-transfer --send file_or_dir_to_send
+# 5) on another terminal on localhost: run ./tmux-file-transfer --receive tmux_transfer.tar.gz
+#
+case $1 in
+--send)
+	SRC=$2
+	reset
+	echo sending $SRC
+
+	# open stdin as fd4 so that we can read from the original stdin instead of pipes
+	exec 4<> /dev/stdin
+
+	produce() {
+		tar cf - $SRC 2>/dev/null | gzip | base64
+	}
+
+	encode() {
+		# Size of block to send at a time. Should be set with value
+		# less than the scrollback buffer.
+		BATCH_SIZE=$((1000*1024))
+		BATCH_NUM=0
+		while true
+		do
+			echo ==== BEGIN BATCH ${BATCH_NUM} ====
+			DATA=$(dd status=none bs=1 ibs=1 count=$BATCH_SIZE)
+			echo "$DATA"
+			echo ==== END BATCH ${BATCH_NUM} ====
+			BATCH_NUM=$((BATCH_NUM+1))
+			if [[ "$DATA" = "" ]]
+			then
+				echo "==== All ${BATCH_NUM} blocks have been written ===="
+				break
+			fi
+			read <&4
+		done
+	}
+	produce | encode
+	;;
+
+--receive)
+	DST=$2
+	
+	decode() {
+		BATCH_NUM=0
+		while true
+		do
+			SCROLLBACK=$(tmux capture-pane -pS -)
+			TAIL=$(echo $SCROLLBACK | tail -c 1024)
+
+			# Look for start and end of batch
+			START="==== BEGIN BATCH ${BATCH_NUM} ===="
+			END="==== END BATCH ${BATCH_NUM} ===="
+			LAST="==== All ${BATCH_NUM} blocks have been written ===="
+			if [[ $(echo "$TAIL" | grep "$END") ]]
+			then
+				# Extract the content between the block START and END lines
+				echo "$SCROLLBACK" | awk "/$START/{flag=1;next}/$END/{flag=0}flag"
+				BATCH_NUM=$((BATCH_NUM+1))
+
+				# Send a new line character to trigger sending of the next block
+				tmux send-keys ''
+			elif [[ $(echo "$TAIL" | grep "$LAST") ]]
+			then
+				echo "received all blocks" >&2
+				break
+			else
+				sleep 0.1
+			fi
+		done
+	}
+	decode | base64 --decode | pv --rate --average-rate --timer --interval 2 > $DST
+	;;
+*)
+	echo "tmux-file-transfer [--send path] [--receive file.tar.gz]"
+	exit 127
+esac
+
